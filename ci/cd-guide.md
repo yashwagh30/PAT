@@ -1,29 +1,29 @@
 # CI/CD Integration Guide
 
-This guide provides examples for running Hydrophone in various CI/CD environments to automate Conformance Report generation.
+This guide provides examples for running Hydrophone in various CI/CD environments to automate the generation of Kubernetes Conformance Reports.
 
 ## General Principles
 
 When integrating Hydrophone into CI/CD, keep these points in mind:
-*   **Authentication:** The Hydrophone container needs a `kubeconfig` file or token with sufficient permissions to access the target cluster.
+*   **Authentication:** The Hydrophone container must have a `kubeconfig` file with sufficient permissions to access the resources in the target cluster.
 *   **Secrets Management:** Never hardcode credentials. Use your CI/CD system's built-in secrets store (e.g., GitHub Secrets, GitLab CI Variables) to securely pass the `kubeconfig` or its contents.
-*   **Output:** By default, Hydrophone saves the report to `./conformance-report.html`. You will likely want to add a step to upload this artifact.
+*   **Output:** Hydrophone writes the report to the path specified by the `--output` flag, which defaults to `./conformance-report.html`. You will need to use a volume mount to make this file available to the CI/CD host system for uploading/archiving.
 
 ## Examples
 
 ### GitHub Actions
 
-This workflow example assumes you have stored a base64-encoded kubeconfig file as a secret in your GitHub repository named `KUBECONFIG_B64`.
+This workflow example assumes you have stored the entire contents of a valid `kubeconfig` file as a secret in your GitHub repository named `KUBECONFIG_CONTENT`.
 
-1.  Create a secret in your GitHub repository settings named `KUBECONFIG_B64` containing the output of `cat ~/.kube/config | base64 -w 0`.
-2.  Create a workflow file (e.g., `.github/workflows/conformance.yaml`):
+1.  **Create the Secret:** In your GitHub repository, go to **Settings > Secrets and variables > Actions**. Create a New Repository Secret named `KUBECONFIG_CONTENT` and paste your complete kubeconfig file contents.
+2.  **Create the Workflow File:** Create the file `.github/workflows/conformance.yaml` in your repository with the following content:
 
 ```yaml
-name: Kubernetes Conformance Test
+name: Generate Conformance Report
 on:
   workflow_dispatch: # Allows manual triggering
   schedule:
-    - cron: '0 0 * * 0' # Run weekly on Sunday
+    - cron: '0 0 * * 0' # Run weekly on Sunday at 00:00 UTC
 
 jobs:
   conformance:
@@ -32,45 +32,59 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Decode Kubeconfig
+      - name: Write Kubeconfig
         run: |
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig.yaml
+          # Create the .kube directory and write the secret content to a file
+          mkdir -p .kube
+          echo "${{ secrets.KUBECONFIG_CONTENT }}" > .kube/config
         shell: bash
 
       - name: Run Hydrophone
+        # Use the Docker container directly as an action.
+        # Mount the .kube directory and the current workspace into the container.
         uses: docker://gcr.io/k8s-staging-conformance/hydrophone:latest
         with:
-          args: --kubeconfig=/kubeconfig.yaml
+          # The args are passed to the Hydrophone entrypoint inside the container.
+          # The kubeconfig is now at the mount path, and the output will be written to the workspace.
+          args: --kubeconfig=/.kube/config --quiet
         env:
-          # Mount the decoded kubeconfig into the container
-          KUBECONFIG: /kubeconfig.yaml
+          # Mount the host's filesystem paths into the container
+          KUBECONFIG: /.kube/config
+          # The Hydrophone container's WORKDIR is '/app', so we mount the workspace there.
+          # This ensures the output file 'conformance-report.html' is written to the GitHub Actions workspace.
+          HOST_WORKSPACE: /app
 
-      - name: Upload Conformance Report
+      - name: Upload Conformance Report Artifact
         uses: actions/upload-artifact@v4
         with:
           name: conformance-report
-          path: conformance-report.html
+          path: conformance-report.html # This is now in the workspace root
 ```
 
 ### GitLab CI
 
-This example uses a GitLab CI variable to store the entire `kubeconfig` content.
+This example uses a GitLab CI file variable to store the entire `kubeconfig` content.
 
-1.  In your GitLab project, go to **Settings > CI/CD > Variables**. Add a variable named `KUBECONFIG_CONTENT` and paste the entire contents of your `~/.kube/config` file. **Mask the variable** if possible.
-2.  Create a job in your `.gitlab-ci.yml` file:
+1.  **Create the Variable:** In your GitLab project, go to **Settings > CI/CD > Variables**. Add a variable named `KUBECONFIG_CONTENT` and paste the entire contents of your kubeconfig file. **Set the variable to be masked and protected** if possible.
+2.  **Create the Job:** Add the following job to your `.gitlab-ci.yml` file:
 
 ```yaml
 generate_conformance_report:
   image: docker:latest
   services:
     - docker:dind
-  variables:
-    # Mount the kubeconfig file from the variable
-    KUBECONFIG: /kubeconfig.yaml
   before_script:
-    - echo "$KUBECONFIG_CONTENT" > kubeconfig.yaml
+    - mkdir -p .kube
+    - echo "$KUBECONFIG_CONTENT" > .kube/config
   script:
-    - docker run -v $(pwd)/kubeconfig.yaml:/.kube/config gcr.io/k8s-staging-conformance/hydrophone:latest --kubeconfig=/.kube/config
+    - |
+      docker run \
+        --volume "$(pwd)/.kube:/.kube" \
+        --volume "$(pwd):/app" \
+        --workdir /app \
+        gcr.io/k8s-staging-conformance/hydrophone:latest \
+        --kubeconfig=/.kube/config \
+        --quiet
   artifacts:
     paths:
       - conformance-report.html
@@ -81,23 +95,34 @@ generate_conformance_report:
 
 This example uses the Jenkins `withCredentials` directive to bind a credential containing the kubeconfig file.
 
-1.  In Jenkins, add a credential of type "Secret file" (e.g., with an ID like `cluster-kubeconfig`).
-2.  Create a `Jenkinsfile` in your project:
+1.  **Create the Credential:** In Jenkins, add a credential of type "Secret file". Upload your kubeconfig file and note its ID (e.g., `cluster-kubeconfig`).
+2.  **Create the Pipeline:** Create a `Jenkinsfile` in your project with the following content:
 
 ```groovy
 pipeline {
     agent any
-    environment {
-        KUBECONFIG = "${WORKSPACE}/kubeconfig.yaml"
-    }
     stages {
         stage('Generate Conformance Report') {
             steps {
-                // This step copies the credential file to the workspace
-                withCredentials([file(credentialsId: 'cluster-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
-                    sh 'cp $KUBECONFIG_FILE ./kubeconfig.yaml'
+                script {
+                    // This step securely copies the credential file to the workspace
+                    withCredentials([file(credentialsId: 'cluster-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                        sh '''
+                            mkdir -p .kube
+                            cp "$KUBECONFIG_FILE" .kube/config
+                        '''
+                    }
+                    // Run Hydrophone, mounting the .kube dir and workspace
+                    sh '''
+                        docker run \\
+                          --volume "$(pwd)/.kube:/.kube" \\
+                          --volume "$(pwd):/app" \\
+                          --workdir /app \\
+                          gcr.io/k8s-staging-conformance/hydrophone:latest \\
+                          --kubeconfig=/.kube/config \\
+                          --quiet
+                    '''
                 }
-                sh 'docker run -v $(pwd)/kubeconfig.yaml:/.kube/config gcr.io/k8s-staging-conformance/hydrophone:latest --kubeconfig=/.kube/config'
             }
         }
     }
@@ -111,27 +136,30 @@ pipeline {
 
 ### Prow
 
-(Prow is heavily used in Kubernetes core development. An example might look more complex and involve a `PodSpec`.)
+Integration with Prow typically involves defining a `PodSpec` in a prow job configuration. This is often managed by cluster administrators.
 
 ```yaml
-# This is a basic example of a prow job config (prowjob.yaml).
-# It would typically be configured by a cluster administrator.
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: hydrophone-conformance-test
+# Example snippet from a prow job config (prowjob.yaml)
+# This runs Hydrophone with in-cluster authentication (e.g., a service account).
 spec:
-  template:
-    spec:
-      containers:
-      - name: hydrophone
-        image: gcr.io/k8s-staging-conformance/hydrophone:latest
-        args: ["--kubeconfig=/path/to/incluster/kubeconfig"]
-        # ... other required volumes and mounts for in-cluster config
-      restartPolicy: Never
+  containers:
+  - name: hydrophone
+    image: gcr.io/k8s-staging-conformance/hydrophone:latest
+    args:
+      - "--kubeconfig=/etc/kubeconfig/config" # Path if using a mounted in-cluster config
+      - "--output=/logs/artifacts/conformance-report.html" # Prow expects artifacts in /logs/artifacts/
+    volumeMounts:
+    - name: kubeconfig
+      mountPath: /etc/kubeconfig
+      readOnly: true
+    # ... other required volumes
+  volumes:
+  - name: kubeconfig
+    secret:
+      secretName: my-cluster-kubeconfig # Secret created by an admin
 ```
 
-**Note for Prow:** In-cluster configuration is often handled automatically. This is a advanced example and users may need to consult their cluster administrator.
+**Note for Prow:** This is an advanced example. The exact setup depends heavily on how the Prow cluster is configured. Users should consult their cluster administrator.
 
 ## Need Help?
 
